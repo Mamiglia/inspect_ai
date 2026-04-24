@@ -11,6 +11,7 @@ from openai import (
     UnprocessableEntityError,
 )
 from openai._types import NOT_GIVEN
+from openai.types import Completion
 from openai.types.chat import (
     ChatCompletion,
     ChatCompletionMessageParam,
@@ -32,11 +33,20 @@ from inspect_ai.model._providers.util.llama31 import Llama31Handler
 from inspect_ai.tool import ToolChoice, ToolInfo
 from inspect_ai.util._json import JSON_SCHEMA_EXTENDED_FIELDS
 
-from .._chat_message import ChatMessage, ChatMessageTool
+from .._chat_message import ChatMessage, ChatMessageAssistant, ChatMessageTool
 from .._generate_config import GenerateConfig
 from .._model import ModelAPI
 from .._model_call import ModelCall, as_error_response
-from .._model_output import ChatCompletionChoice, ModelOutput
+from .._model_output import (
+    ChatCompletionChoice,
+    Logprob,
+    Logprobs,
+    ModelOutput,
+    ModelUsage,
+    StopReason,
+    TopLogprob,
+    as_stop_reason,
+)
 from .._openai import (
     OpenAIAsyncHttpxClient,
     OpenAIResponseError,
@@ -67,6 +77,7 @@ class OpenAICompatibleAPI(ModelAPI):
         emulate_tools: bool = False,
         responses_api: bool | None = None,
         responses_store: bool | None = None,
+        completions_api: bool | None = None,
         stream: bool | None = None,
         strict_tools: bool = True,
         client_timeout: float | None = None,
@@ -118,9 +129,14 @@ class OpenAICompatibleAPI(ModelAPI):
         self.emulate_tools = emulate_tools
         self.responses_api = responses_api
         self.responses_store = responses_store
+        self.completions_api = completions_api
         if self.emulate_tools and self.responses_api:
             raise ValueError(
                 "emulate_tools is not compatible with using the responses_api"
+            )
+        if self.completions_api and (self.responses_api or self.emulate_tools):
+            raise ValueError(
+                "completions_api is not compatible with responses_api or emulate_tools"
             )
         self.stream = False if stream is None else stream
         self.strict_tools = strict_tools
@@ -192,6 +208,9 @@ class OpenAICompatibleAPI(ModelAPI):
                 batcher=None,
                 handle_bad_request=self.handle_bad_request,
             )
+
+        elif self.completions_api:
+            return await self._generate_legacy_completions(input, config)
 
         else:
             # tool emulation if requested
@@ -272,6 +291,137 @@ class OpenAICompatibleAPI(ModelAPI):
                     as_error_response(ex.body), self._http_hooks.end_request(request_id)
                 )
                 return self.handle_bad_request(ex), model_call
+
+    async def _generate_legacy_completions(
+        self,
+        input: list[ChatMessage],
+        config: GenerateConfig,
+    ) -> tuple[ModelOutput | Exception, ModelCall]:
+        # allocate request_id (so we can see it from ModelCall)
+        request_id = self._http_hooks.start_request()
+
+        # Build prompt from messages (completion mode only supports text)
+        prompt_parts = []
+        for msg in input:
+            if isinstance(msg.content, list) and any(
+                c.type == "image" for c in msg.content
+            ):
+                logger.warning(
+                    "Image content detected in completion mode — images are not "
+                    "supported by completions-style payloads and will be ignored."
+                )
+            prompt_parts.append(msg.text)
+        prompt = "".join(prompt_parts)
+
+        # get completion params
+        completion_params = self.completion_params(
+            config=config,
+            tools=False,
+        )
+
+        # prepare request
+        request = dict(
+            prompt=prompt,
+            extra_headers={HttpxHooks.REQUEST_ID_HEADER: request_id}
+            | (config.extra_headers or {}),
+            **completion_params,
+        )
+
+        # remove chat-only params
+        request.pop("tools", None)
+        request.pop("tool_choice", None)
+        request.pop("parallel_tool_calls", None)
+        request.pop("response_format", None)
+
+        model_call = set_active_model_event_call(request, openai_media_filter)
+
+        try:
+            # generate completion
+            completion = await self.client.completions.create(**request)
+
+            # guard against the openai SDK returning a non-Completion
+            if not isinstance(completion, Completion):
+                raise OpenAIResponseError(
+                    "server_error",
+                    f"Unexpected non-Completion response: {completion!r}",
+                )
+
+            response = completion.model_dump()
+            model_call.set_response(response, self._http_hooks.end_request(request_id))
+            self.on_response(response)
+
+            # get choices
+            choices: list[ChatCompletionChoice] = []
+            for choice in completion.choices:
+                # build logprobs
+                logprobs: Logprobs | None = None
+                if choice.logprobs:
+                    content_logprobs = []
+                    tokens = choice.logprobs.tokens or []
+                    token_logprobs = choice.logprobs.token_logprobs or []
+                    top_logprobs_list = choice.logprobs.top_logprobs or []
+
+                    for i, token in enumerate(tokens):
+                        top_lps = None
+                        if (
+                            top_logprobs_list
+                            and i < len(top_logprobs_list)
+                            and top_logprobs_list[i]
+                        ):
+                            top_lps = [
+                                TopLogprob(token=t, logprob=lp)
+                                for t, lp in top_logprobs_list[i].items()
+                            ]
+
+                        raw = token_logprobs[i] if i < len(token_logprobs) else None
+                        content_logprobs.append(
+                            Logprob(
+                                token=token,
+                                logprob=raw if raw is not None else 0.0,
+                                top_logprobs=top_lps,
+                            )
+                        )
+                    logprobs = Logprobs(content=content_logprobs)
+
+                choices.append(
+                    ChatCompletionChoice(
+                        message=ChatMessageAssistant(
+                            content=choice.text,
+                            model=completion.model,
+                            source="generate",
+                        ),
+                        stop_reason=as_stop_reason(choice.finish_reason),
+                        logprobs=logprobs,
+                    )
+                )
+
+            # return output
+            return (
+                ModelOutput(
+                    model=completion.model,
+                    choices=choices,
+                    usage=(
+                        ModelUsage(
+                            input_tokens=completion.usage.prompt_tokens,
+                            output_tokens=completion.usage.completion_tokens,
+                            total_tokens=completion.usage.total_tokens,
+                        )
+                        if completion.usage
+                        else None
+                    ),
+                ),
+                model_call,
+            )
+
+        except (
+            BadRequestError,
+            UnprocessableEntityError,
+            PermissionDeniedError,
+        ) as ex:
+            model_call.set_error(
+                as_error_response(ex.body), self._http_hooks.end_request(request_id)
+            )
+            return self.handle_bad_request(ex), model_call
 
     def resolve_tools(
         self, tools: list[ToolInfo], tool_choice: ToolChoice, config: GenerateConfig
