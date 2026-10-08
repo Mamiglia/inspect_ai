@@ -620,7 +620,16 @@ class AsyncFilesystem(AbstractAsyncContextManager["AsyncFilesystem"]):
     async def read_file_bytes_fully(
         self, filename: str, start: int, end: int | None
     ) -> bytes:
-        """Read the byte range [start, end) of a file into bytes (end=None reads to EOF)."""
+        """Read the byte range [start, end) of a file into bytes (end=None reads to EOF).
+
+        Small local ranges are read on the event loop, since a thread hop costs
+        more than the read; larger or open-ended ones take one thread hop.
+        """
+        if not is_s3_filename(filename) and filesystem(filename).is_local():
+            path = local_path(filename)
+            if end is not None and end - start <= _READ_LOCAL_INLINE_MAX:
+                return _read_local_range(path, start, end)
+            return await anyio.to_thread.run_sync(_read_local_range, path, start, end)
         stream = await self.read_file_bytes(filename, start, end)
         chunks: list[bytes] = []
         try:
@@ -1708,7 +1717,17 @@ _STREAMING_COPY_BUFSIZE = 16 * 1024 * 1024  # 16 MB
 # accumulating a range into memory.
 _READ_FULLY_CHUNK_SIZE = 1024 * 1024  # 1 MB
 
+# Largest local range `read_file_bytes_fully` reads on the event loop.
+_READ_LOCAL_INLINE_MAX = 1024 * 1024  # 1 MB
+
 _S3_ABORT_TIMEOUT = 30
+
+
+def _read_local_range(path: str, start: int, end: int | None) -> bytes:
+    """Read the byte range [start, end) of a local file (end=None reads to EOF)."""
+    with open(path, "rb") as f:
+        f.seek(start)
+        return f.read(-1 if end is None else max(0, end - start))
 
 
 def _copy_local_file_into(path: str, dest: BinaryIO, chunk_size: int) -> None:

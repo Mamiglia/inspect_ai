@@ -20,6 +20,8 @@
 - Agent Bridge: A bridged Anthropic client now sees conflict, timeout, and billing errors as such instead of as generic server errors.
 - Agent Bridge: Sandboxed agents now receive exhausted provider errors with their original status and error details.
 - Dependencies: Require `nest_asyncio2` >= 1.7.4, fixing cancel scope errors (e.g. from Mistral streaming) after Inspect is called synchronously from a notebook or another running event loop.
+- Logs: Reading a local `.eval` log is faster.
+- Logs: `read_eval_log_samples()` no longer slows down quadratically with sample count; iterating a large `.eval` log now takes about as long as reading it whole.
 
 ## 0.3.277 (06 October 2026)
 

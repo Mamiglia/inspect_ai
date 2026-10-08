@@ -390,6 +390,11 @@ class AsyncZipReader:
         self._lock = anyio.Lock()
 
     @property
+    def central_directory(self) -> CentralDirectory | None:
+        """The central directory, if it has been read."""
+        return self._central_directory
+
+    @property
     def etag(self) -> str | None:
         """ETag from the S3 response used to read the central directory."""
         cd = self._central_directory

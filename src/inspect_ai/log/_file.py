@@ -20,7 +20,7 @@ from pydantic import (
 )
 
 from inspect_ai._util._async import current_async_backend, run_coroutine, tg_collect
-from inspect_ai._util.async_zip import AsyncZipReader
+from inspect_ai._util.async_zip import AsyncZipReader, CentralDirectory
 from inspect_ai._util.asyncfiles import AsyncFilesystem, get_async_filesystem
 from inspect_ai._util.azure import AzureAuthError, is_azure_listing_auth_error
 from inspect_ai._util.constants import ALL_LOG_FORMATS, EVAL_LOG_FORMAT
@@ -1075,19 +1075,44 @@ def read_eval_log_samples(
             + "Specify all_samples_required=False to read the samples that exist."
         )
 
+    log_path = (
+        log_file
+        if isinstance(log_file, str)
+        else log_file.as_posix()
+        if isinstance(log_file, Path)
+        else log_file.name
+    )
+
+    # share the zip central directory across samples rather than reparsing it
+    central_directory: CentralDirectory | None = None
+
+    async def read_sample(sample_id: int | str, epoch: int) -> EvalSample:
+        nonlocal central_directory
+        # verify CRCs so a log rewritten mid-iteration (stale offsets) raises
+        # rather than yielding the wrong member's bytes
+        reader = AsyncZipReader(
+            get_async_filesystem(),
+            log_path,
+            central_directory=central_directory,
+            verify_crc=True,
+        )
+        sample = await read_eval_log_sample_async(
+            log_path,
+            sample_id,
+            epoch,
+            resolve_attachments=resolve_attachments,
+            format=format,
+            exclude_fields=exclude_fields,
+            reader=reader,
+        )
+        central_directory = reader.central_directory
+        return sample
+
     # loop over samples and epochs
     for sample_id in log_header.eval.dataset.sample_ids:
         for epoch_id in range(1, (log_header.eval.config.epochs or 1) + 1):
             try:
-                sample = read_eval_log_sample(
-                    log_file=log_file,
-                    id=sample_id,
-                    epoch=epoch_id,
-                    resolve_attachments=resolve_attachments,
-                    format=format,
-                    exclude_fields=exclude_fields,
-                )
-                yield sample
+                yield run_coroutine(read_sample(sample_id, epoch_id))
             except IndexError:
                 if all_samples_required:
                     raise

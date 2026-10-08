@@ -518,8 +518,8 @@ async def get_log_bytes(
             log_file, start=start, end=adjusted_end
         )
     elif fs.is_local():
-        # Read off the event loop via asyncfiles' anyio-backed reader so the
-        # read doesn't pin the loop. An open-ended read runs to EOF rather
+        # Ranges up to 1 MB are read inline; larger or open-ended ranges are
+        # read in a worker thread. An open-ended read runs to EOF rather
         # than to a stat'ed size, which would truncate files that grow
         # between stat and read (in-progress evals are rewritten in place).
         res = await AsyncFilesystem().read_file_bytes_fully(

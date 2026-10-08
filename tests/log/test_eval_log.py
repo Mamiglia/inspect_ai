@@ -493,6 +493,51 @@ def test_rewrite_eval_zip_dedupes_duplicate_members():
         assert result.read(member) == superseding
 
 
+def test_read_eval_log_samples_parses_central_directory_once():
+    """`read_eval_log_samples` parses the zip central directory once, not per sample."""
+    from inspect_ai._util import async_zip
+
+    file_path = os.path.join("tests", "log", "test_eval_log", "log_streaming.eval")
+    with patch.object(
+        async_zip,
+        "_parse_central_directory",
+        wraps=async_zip._parse_central_directory,
+    ) as parse:
+        read_eval_log(file_path, header_only=True)
+        header_parses = parse.call_count
+        parse.reset_mock()
+        samples = list(read_eval_log_samples(file_path))
+
+    assert len(samples) == 4
+    assert parse.call_count == header_parses + 1
+
+
+def test_read_eval_log_samples_detects_log_rewritten_mid_iteration(tmp_path):
+    """A member changed after the central directory was read raises, not misreads."""
+    from inspect_ai._util.async_zip import ZipCrcError
+
+    src = os.path.join("tests", "log", "test_eval_log", "log_streaming.eval")
+    with ZipFile(src) as zf:
+        members = {name: zf.read(name) for name in zf.namelist()}
+
+    def write_log(contents: dict[str, bytes]) -> None:
+        with ZipFile(log_file, "w") as zf:
+            for name, data in contents.items():
+                zf.writestr(name, data)
+
+    log_file = str(tmp_path / "rewritten.eval")
+    write_log(members)
+    samples = read_eval_log_samples(log_file)
+    next(samples)
+
+    # same-length edit, so stored offsets and sizes still line up
+    edited = members["samples/2_epoch_2.json"].replace(b'"epoch": 2', b'"epoch": 3', 1)
+    assert edited != members["samples/2_epoch_2.json"]
+    write_log({**members, "samples/2_epoch_2.json": edited})
+    with pytest.raises(ZipCrcError):
+        list(samples)
+
+
 def test_read_eval_log_samples_with_duplicate_members(tmp_path):
     """`read_eval_log_samples` yields the superseding record, once.
 

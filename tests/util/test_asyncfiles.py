@@ -477,6 +477,31 @@ async def test_local_read_file_bytes_fully_empty_range():
         Path(temp_path).unlink()
 
 
+async def test_local_read_file_bytes_fully_thread_hops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Small local ranges skip the worker thread; open-ended ones take one hop."""
+    data = b"0123456789" * 1000
+    path = tmp_path / "data.bin"
+    path.write_bytes(data)
+    calls: list[Callable[..., Any]] = []
+    real_run_sync = anyio.to_thread.run_sync
+
+    async def counting_run_sync(func: Callable[..., Any], *args: Any) -> Any:
+        calls.append(func)
+        return await real_run_sync(func, *args)
+
+    monkeypatch.setattr(anyio.to_thread, "run_sync", counting_run_sync)
+
+    async with AsyncFilesystem() as fs:
+        assert await fs.read_file_bytes_fully(str(path), 100, 500) == data[100:500]
+        assert calls == []
+        assert await fs.read_file_bytes_fully(str(path), 9990, None) == b"0123456789"
+        assert len(calls) == 1
+        with pytest.raises(FileNotFoundError):
+            await fs.read_file_bytes_fully(str(tmp_path / "missing"), 0, 10)
+
+
 async def test_local_read_file_bytes_fully_large_file():
     """Test read_file_bytes_fully with larger file."""
     test_data = b"0123456789" * 1000  # 10,000 bytes
